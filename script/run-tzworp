@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# 运行 tzWarp（team_relay 构建）
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+export PATH="${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:${PATH}"
+
+# 中转站（可覆盖）
+export TEAM_RELAY_BASE_URL="${TEAM_RELAY_BASE_URL:-https://tzai.kdp.cool/v1}"
+
+# 优先使用已有 TZAI_API_KEY / TEAM_RELAY_API_KEY
+if [[ -z "${TEAM_RELAY_API_KEY:-}" && -z "${TZAI_API_KEY:-}" ]]; then
+  echo "警告: 未设置 TZAI_API_KEY 或 TEAM_RELAY_API_KEY，AI 将无法调用中转站。" >&2
+fi
+
+echo "tzWarp → relay=${TEAM_RELAY_BASE_URL}"
+exec cargo run -p warp --bin tzworp --features team_relay -- "$@"
