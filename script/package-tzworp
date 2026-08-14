@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# 打包 tzWarp macOS 正式安装包（.app + .dmg + .zip）。
+# 在 Warp 源码根目录执行：./script/package-tzworp
+# 若上层是 tzWarp 工作区，产物写到 ../dist；否则写到 ./dist。
+set -euo pipefail
+
+WARP="$(cd "$(dirname "$0")/.." && pwd)"
+PARENT="$(cd "$WARP/.." && pwd)"
+VERSION="${VERSION:-$(tr -d '[:space:]' < "$WARP/../VERSION" 2>/dev/null || echo 1.0.0)}"
+if [[ -f "$PARENT/VERSION" ]]; then
+  VERSION="${VERSION:-$(tr -d '[:space:]' < "$PARENT/VERSION")}"
+fi
+VERSION="${VERSION:-1.0.0}"
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+  arm64|aarch64) ARCH_LABEL="arm64" ;;
+  x86_64) ARCH_LABEL="x86_64" ;;
+  *) ARCH_LABEL="$ARCH" ;;
+esac
+
+PROFILE="${PROFILE:-release-lto}"
+case "$PROFILE" in
+  release-lto) PROFILE_DIR="release-lto" ;;
+  release) PROFILE_DIR="release" ;;
+  *) PROFILE_DIR="$PROFILE" ;;
+esac
+
+APP_NAME="tzWarp"
+BIN_NAME="tzworp"
+BUNDLE_ID="cool.kdp.tzWarp"
+
+if [[ -f "$PARENT/assets/AppIcon.icns" ]]; then
+  ICON_ICNS="$PARENT/assets/AppIcon.icns"
+  DIST="$PARENT/dist"
+else
+  ICON_ICNS="$WARP/images/AppIcon.icns"
+  DIST="$WARP/dist"
+fi
+
+APP_NAME="tzWarp"
+STAGE="$DIST/stage"
+APP="$STAGE/${APP_NAME}.app"
+DMG="$DIST/${APP_NAME}-${VERSION}-macos-${ARCH_LABEL}.dmg"
+ZIP="$DIST/${APP_NAME}-${VERSION}-macos-${ARCH_LABEL}.zip"
+
+if [[ ! -f "$ICON_ICNS" ]]; then
+  echo "缺少图标: $ICON_ICNS" >&2
+  exit 1
+fi
+
+export PATH="${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:${PATH}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+export GIT_RELEASE_TAG="v${VERSION}"
+export PROTOC="${PROTOC:-/opt/homebrew/bin/protoc}"
+
+echo "==> 构建 ${APP_NAME} ${GIT_RELEASE_TAG} (${ARCH_LABEL}, ${PROFILE})"
+cd "$WARP"
+cargo build -p warp --bin "$BIN_NAME" --profile "$PROFILE" --features team_relay
+
+BIN="$WARP/target/${PROFILE_DIR}/${BIN_NAME}"
+if [[ ! -x "$BIN" ]]; then
+  echo "找不到二进制: $BIN" >&2
+  exit 1
+fi
+
+STRIPPED="$DIST/.${BIN_NAME}.stripped"
+mkdir -p "$DIST"
+cp "$BIN" "$STRIPPED"
+strip -x "$STRIPPED"
+
+echo "==> 组装 ${APP_NAME}.app"
+rm -rf "$STAGE"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$STRIPPED" "$APP/Contents/MacOS/${BIN_NAME}"
+chmod 755 "$APP/Contents/MacOS/${BIN_NAME}"
+cp "$ICON_ICNS" "$APP/Contents/Resources/AppIcon.icns"
+rm -f "$STRIPPED"
+
+cat > "$APP/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>zh_CN</string>
+  <key>CFBundleDisplayName</key>
+  <string>${APP_NAME}</string>
+  <key>CFBundleExecutable</key>
+  <string>${BIN_NAME}</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIconName</key>
+  <string>AppIcon</string>
+  <key>CFBundleIdentifier</key>
+  <string>${BUNDLE_ID}</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>${APP_NAME}</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${VERSION}</string>
+  <key>CFBundleVersion</key>
+  <string>${VERSION}</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSHumanReadableCopyright</key>
+  <string>© 2026 tzWarp（基于 Warp，AGPL-3.0）</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>tzWarp</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>tzworp</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>
+EOF
+
+if command -v codesign >/dev/null; then
+  echo "==> ad-hoc 签名（未公证；用户需右键打开一次）"
+  codesign --force --deep --sign - --timestamp=none "$APP" 2>/dev/null || true
+fi
+
+echo "==> 制作 DMG / ZIP"
+rm -f "$DMG" "$ZIP"
+DMG_SRC="$DIST/dmg"
+rm -rf "$DMG_SRC"
+mkdir -p "$DMG_SRC"
+cp -R "$APP" "$DMG_SRC/${APP_NAME}.app"
+ln -s /Applications "$DMG_SRC/Applications"
+cat > "$DMG_SRC/安装说明.txt" <<EOF
+tzWarp ${VERSION}
+
+1. 把 tzWarp 拖到 Applications。
+2. 第一次打开：右键 tzWarp → 打开（未经过 Apple 公证）。
+3. 在「设置 → 智能体」粘贴小桃子 API 密钥，或：
+     mkdir -p ~/.tzworp
+     echo '你的key' > ~/.tzworp/token
+     chmod 600 ~/.tzworp/token
+
+项目主页：https://github.com/kedoupi/tzWarp
+EOF
+
+hdiutil create \
+  -volname "${APP_NAME} ${VERSION}" \
+  -srcfolder "$DMG_SRC" \
+  -ov \
+  -format UDZO \
+  "$DMG"
+
+ditto -c -k --keepParent "$APP" "$ZIP"
+rm -rf "$DMG_SRC" "$STAGE"
+
+echo
+echo "完成："
+echo "  $DMG"
+echo "  $ZIP"
+ls -lh "$DMG" "$ZIP"

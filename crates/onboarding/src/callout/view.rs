@@ -1,0 +1,487 @@
+use ui_components::Component;
+use warp_core::ui::appearance::Appearance;
+use warpui_core::elements::Empty;
+use warpui_core::keymap::macros::*;
+use warpui_core::keymap::{FixedBinding, Keystroke};
+use warpui_core::{
+    AppContext, Element, Entity, EventContext, ModelHandle, SingletonEntity, TypedActionView, View,
+    ViewContext,
+};
+
+/// Display strings for keybindings shown in the onboarding callout.
+#[derive(Clone, Debug)]
+pub struct OnboardingKeybindings {
+    /// Display string for toggling between agent/terminal mode (e.g., "⌘I")
+    pub toggle_input_mode: String,
+    /// Display string for submitting to local agent (e.g., "⌘⏎")
+    pub submit_to_local_agent: String,
+    /// Display string for submitting to cloud agent (e.g., "⌘⌥⏎")
+    pub submit_to_cloud_agent: String,
+    /// Display string for returning to terminal mode (e.g., "Esc")
+    pub return_to_terminal_mode: String,
+}
+
+use crate::OnboardingIntention;
+use crate::callout::model::{
+    AgentModalityCalloutState, FinalState, OnboardingCalloutModel, OnboardingCalloutModelEvent,
+    OnboardingCalloutState, OnboardingQuery, UniversalInputCalloutState,
+};
+use crate::components::onboarding_callout::{self, Button, StepStatus};
+
+/// Options for rendering a callout.
+struct CalloutOptions {
+    title: &'static str,
+    /// Pre-built text with keybindings already embedded
+    text: String,
+    step: StepStatus,
+    right_button: ButtonOptions,
+    /// Optional left button (e.g., "Skip", "Back to terminal")
+    left_button: Option<ButtonOptions>,
+    /// Optional checkbox for natural language detection
+    checkbox: Option<CheckboxOptions>,
+}
+
+struct ButtonOptions {
+    text: &'static str,
+    action: OnboardingCalloutViewAction,
+    keystroke: Option<Keystroke>,
+}
+
+struct CheckboxOptions {
+    label: &'static str,
+    checked: bool,
+}
+
+fn get_universal_input_callout_options(
+    state: UniversalInputCalloutState,
+    has_project: bool,
+    keybindings: &OnboardingKeybindings,
+) -> Option<CalloutOptions> {
+    match state {
+        UniversalInputCalloutState::MeetInput => Some(CalloutOptions {
+            title: "认识 tzWarp 输入框",
+            text: format!(
+                "输入框支持终端命令和 Agent 提示词，并自动识别输入类型。按 {} 可锁定为 Agent 模式（自然语言）或终端模式（命令）。",
+                keybindings.toggle_input_mode
+            ),
+            step: StepStatus::new(0, 2),
+            left_button: None,
+            right_button: ButtonOptions {
+                text: "下一步",
+                action: OnboardingCalloutViewAction::NextClicked,
+                keystroke: Some(Keystroke::parse("enter").unwrap_or_default()),
+            },
+            checkbox: None,
+        }),
+        UniversalInputCalloutState::TalkToAgent => Some(CalloutOptions {
+            title: "与 Agent 对话",
+            text: "可用自然语言与 Agent 对话。提交下方问题开始：这个仓库有哪些测试？结构如何？覆盖哪些内容？".to_string(),
+            step: StepStatus::new(1, 2),
+            left_button: if has_project {
+                Some(ButtonOptions {
+                    text: "跳过",
+                    action: OnboardingCalloutViewAction::SkipClicked,
+                    keystroke: Some(Keystroke::parse("delete").unwrap_or_default()),
+                })
+            } else {
+                None
+            },
+            right_button: ButtonOptions {
+                text: if has_project { "提交" } else { "完成" },
+                action: OnboardingCalloutViewAction::NextClicked,
+                keystroke: Some(Keystroke::parse("enter").unwrap_or_default()),
+            },
+            checkbox: None,
+        }),
+        UniversalInputCalloutState::Off | UniversalInputCalloutState::Complete(_) => None,
+    }
+}
+
+fn get_agent_modality_callout_options(
+    state: AgentModalityCalloutState,
+    intention: OnboardingIntention,
+    has_project: bool,
+    initial_natural_language_detection_enabled: bool,
+    natural_language_detection_enabled: bool,
+    keybindings: &OnboardingKeybindings,
+) -> Option<CalloutOptions> {
+    let total_steps = match intention {
+        OnboardingIntention::Terminal => 1,
+        OnboardingIntention::AgentDrivenDevelopment => 2,
+    };
+
+    match state {
+        AgentModalityCalloutState::TerminalMode => {
+            let is_final_step = intention == OnboardingIntention::Terminal;
+            // Show different callout content based on initial NL detection state
+            if initial_natural_language_detection_enabled {
+                // NL detection was already enabled - show simpler "overrides" callout without checkbox
+                Some(CalloutOptions {
+                    title: "终端模式",
+                    text: format!(
+                        "在此运行命令。输入自然语言问题或任务时，tzWarp 可建议切换到 Agent 模式。随时按 {} 手动切换。",
+                        keybindings.toggle_input_mode
+                    ),
+                    step: StepStatus::new(0, total_steps),
+                    left_button: None,
+                    right_button: ButtonOptions {
+                        text: if is_final_step { "完成" } else { "下一步" },
+                        action: OnboardingCalloutViewAction::NextClicked,
+                        keystroke: Some(Keystroke::parse("enter").unwrap_or_default()),
+                    },
+                    checkbox: None,
+                })
+            } else {
+                // NL detection was disabled - show full explanation with checkbox to enable
+                Some(CalloutOptions {
+                    title: "终端模式",
+                    text: format!(
+                        "在此运行命令。输入自然语言问题或任务时，tzWarp 可建议切换到 Agent 模式。随时按 {} 手动切换。",
+                        keybindings.toggle_input_mode
+                    ),
+                    step: StepStatus::new(0, total_steps),
+                    left_button: None,
+                    right_button: ButtonOptions {
+                        text: if is_final_step { "完成" } else { "下一步" },
+                        action: OnboardingCalloutViewAction::NextClicked,
+                        keystroke: Some(Keystroke::parse("enter").unwrap_or_default()),
+                    },
+                    checkbox: Some(CheckboxOptions {
+                        label: "启用自然语言识别",
+                        checked: natural_language_detection_enabled,
+                    }),
+                })
+            }
+        }
+        AgentModalityCalloutState::AgentMode => {
+            if has_project {
+                Some(CalloutOptions {
+                    title: "Agent 模式",
+                    text: "Agent 模式为问题和任务保留独立对话，无需离开终端工作流。\n\n提交下方内容以初始化项目，或按 ⊗ 清空后自行开始。".to_string(),
+                    step: StepStatus::new(1, total_steps),
+                    left_button: Some(ButtonOptions {
+                        text: "跳过初始化",
+                        action: OnboardingCalloutViewAction::SkipClicked,
+                        keystroke: Some(Keystroke::parse("delete").unwrap_or_default()),
+                    }),
+                    right_button: ButtonOptions {
+                        text: "初始化",
+                        action: OnboardingCalloutViewAction::NextClicked,
+                        keystroke: Some(Keystroke::parse("enter").unwrap_or_default()),
+                    },
+                    checkbox: None,
+                })
+            } else {
+                Some(CalloutOptions {
+                    title: "Agent 模式",
+                    text: format!(
+                        "Agent 模式为问题和任务保留独立对话，无需离开终端工作流。随时按 {} 返回终端模式。",
+                        keybindings.return_to_terminal_mode
+                    ),
+                    step: StepStatus::new(1, total_steps),
+                    left_button: Some(ButtonOptions {
+                        text: "返回终端",
+                        action: OnboardingCalloutViewAction::BackToTerminalClicked,
+                        keystroke: Some(Keystroke::parse("escape").unwrap_or_default()),
+                    }),
+                    right_button: ButtonOptions {
+                        text: "完成",
+                        action: OnboardingCalloutViewAction::NextClicked,
+                        keystroke: Some(Keystroke::parse("enter").unwrap_or_default()),
+                    },
+                    checkbox: None,
+                })
+            }
+        }
+        AgentModalityCalloutState::Off | AgentModalityCalloutState::Complete(_) => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum OnboardingCalloutViewAction {
+    NextClicked,
+    SkipClicked,
+    BackToTerminalClicked,
+    ToggleCheckbox,
+}
+
+pub fn init(app: &mut AppContext) {
+    app.register_fixed_bindings([
+        FixedBinding::new(
+            "enter",
+            OnboardingCalloutViewAction::NextClicked,
+            id!(OnboardingCalloutView::ui_name()),
+        ),
+        FixedBinding::new(
+            "numpadenter",
+            OnboardingCalloutViewAction::NextClicked,
+            id!(OnboardingCalloutView::ui_name()),
+        ),
+        FixedBinding::new(
+            "backspace",
+            OnboardingCalloutViewAction::SkipClicked,
+            id!(OnboardingCalloutView::ui_name()),
+        ),
+        FixedBinding::new(
+            "escape",
+            OnboardingCalloutViewAction::BackToTerminalClicked,
+            id!(OnboardingCalloutView::ui_name()),
+        ),
+    ]);
+}
+
+#[derive(Clone, Debug)]
+pub enum OnboardingCalloutViewEvent {
+    StateUpdated,
+    Completed {
+        final_state: FinalState,
+    },
+    /// Signals that the terminal should enter agent modality (agent view).
+    EnterAgentModality,
+    /// Emitted when the user toggles the natural language detection checkbox.
+    NaturalLanguageDetectionToggled(bool),
+}
+
+/// A view that renders the onboarding callout UI component based on the current model state
+pub struct OnboardingCalloutView {
+    /// Reference to the model that manages onboarding state
+    model: ModelHandle<OnboardingCalloutModel>,
+    /// The UI component that renders the actual callout
+    callout_component: onboarding_callout::OnboardingCallout,
+    /// Display strings for keybindings shown in the callout
+    keybindings: OnboardingKeybindings,
+}
+
+impl OnboardingCalloutView {
+    /// Create a new view for the UniversalInput onboarding flow.
+    pub fn new_universal_input(
+        has_project: bool,
+        initial_natural_language_detection_enabled: bool,
+        keybindings: OnboardingKeybindings,
+        ctx: &mut ViewContext<Self>,
+    ) -> Self {
+        let model = ctx.add_model(|_ctx| {
+            OnboardingCalloutModel::new_universal_input(
+                has_project,
+                initial_natural_language_detection_enabled,
+            )
+        });
+        Self::with_model(model, keybindings, ctx)
+    }
+
+    /// Create a new view for the AgentModality onboarding flow.
+    pub fn new_agent_modality(
+        has_project: bool,
+        intention: OnboardingIntention,
+        initial_natural_language_detection_enabled: bool,
+        keybindings: OnboardingKeybindings,
+        ctx: &mut ViewContext<Self>,
+    ) -> Self {
+        let model = ctx.add_model(|_ctx| {
+            OnboardingCalloutModel::new_agent_modality(
+                has_project,
+                intention,
+                initial_natural_language_detection_enabled,
+            )
+        });
+        Self::with_model(model, keybindings, ctx)
+    }
+
+    fn with_model(
+        model: ModelHandle<OnboardingCalloutModel>,
+        keybindings: OnboardingKeybindings,
+        ctx: &mut ViewContext<Self>,
+    ) -> Self {
+        // Re-emit model updates as view events so parents can subscribe to the view.
+        ctx.subscribe_to_model(&model, |_me, _model, event, ctx| match event {
+            OnboardingCalloutModelEvent::StateUpdated => {
+                ctx.emit(OnboardingCalloutViewEvent::StateUpdated);
+                ctx.notify();
+            }
+            OnboardingCalloutModelEvent::Completed(final_state) => {
+                ctx.emit(OnboardingCalloutViewEvent::Completed {
+                    final_state: *final_state,
+                });
+                ctx.notify();
+            }
+            OnboardingCalloutModelEvent::EnterAgentModality => {
+                ctx.emit(OnboardingCalloutViewEvent::EnterAgentModality);
+                ctx.notify();
+            }
+            OnboardingCalloutModelEvent::NaturalLanguageDetectionToggled(enabled) => {
+                ctx.emit(OnboardingCalloutViewEvent::NaturalLanguageDetectionToggled(
+                    *enabled,
+                ));
+                ctx.notify();
+            }
+        });
+
+        Self {
+            model,
+            callout_component: onboarding_callout::OnboardingCallout::default(),
+            keybindings,
+        }
+    }
+
+    pub fn has_project(&self, app: &AppContext) -> bool {
+        self.model.as_ref(app).has_project()
+    }
+
+    pub fn start_onboarding(&mut self, ctx: &mut ViewContext<Self>) {
+        self.model.update(ctx, |model, ctx| {
+            model.start_onboarding(ctx);
+        });
+        ctx.notify();
+    }
+
+    pub fn is_onboarding_active(&self, app: &AppContext) -> bool {
+        self.model.as_ref(app).is_onboarding_active()
+    }
+
+    pub fn prompt_string(&self, app: &AppContext) -> String {
+        self.model.as_ref(app).prompt_string()
+    }
+
+    pub fn prompt(&self, app: &AppContext) -> OnboardingQuery {
+        self.model.as_ref(app).prompt()
+    }
+
+    /// Returns true if the callout should be positioned above the zero state.
+    /// For the agent experience state, always position relative to the input box instead.
+    pub fn should_position_above_zero_state(&self, app: &AppContext) -> bool {
+        !matches!(
+            self.model.as_ref(app).state(),
+            OnboardingCalloutState::AgentModality(AgentModalityCalloutState::AgentMode)
+        )
+    }
+
+    fn get_callout_options(&self, app: &AppContext) -> Option<CalloutOptions> {
+        let model = self.model.as_ref(app);
+        match model.state() {
+            OnboardingCalloutState::UniversalInput(state) => {
+                get_universal_input_callout_options(state, model.has_project(), &self.keybindings)
+            }
+            OnboardingCalloutState::AgentModality(state) => get_agent_modality_callout_options(
+                state,
+                model.intention(),
+                model.has_project(),
+                model.initial_natural_language_detection_enabled(),
+                model.natural_language_detection_enabled(),
+                &self.keybindings,
+            ),
+        }
+    }
+}
+
+impl Entity for OnboardingCalloutView {
+    type Event = OnboardingCalloutViewEvent;
+}
+
+impl View for OnboardingCalloutView {
+    fn ui_name() -> &'static str {
+        "OnboardingCalloutView"
+    }
+
+    fn render(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let model = self.model.as_ref(app);
+
+        // Check if onboarding is active and render appropriate callout based on state
+        if !model.is_onboarding_active() {
+            return Empty::new().finish();
+        }
+
+        let Some(options) = self.get_callout_options(app) else {
+            log::warn!(
+                "Onboarding callout view: onboarding is active but state has no callout options: {:?}",
+                model.state()
+            );
+            return Empty::new().finish();
+        };
+
+        let right_button = Button {
+            text: options.right_button.text.into(),
+            keystroke: options.right_button.keystroke,
+            handler: Box::new(move |ctx: &mut EventContext, _app_ctx: &AppContext, _pos| {
+                ctx.dispatch_typed_action(options.right_button.action.clone());
+            }),
+        };
+
+        let left_button = options.left_button.map(|left_opts| Button {
+            text: left_opts.text.into(),
+            keystroke: left_opts.keystroke,
+            handler: Box::new(move |ctx: &mut EventContext, _app_ctx: &AppContext, _pos| {
+                ctx.dispatch_typed_action(left_opts.action.clone());
+            }),
+        });
+
+        let checkbox = options
+            .checkbox
+            .map(|checkbox_opts| onboarding_callout::Checkbox {
+                label: checkbox_opts.label.into(),
+                checked: checkbox_opts.checked,
+                handler: Box::new(|ctx: &mut EventContext, _app_ctx: &AppContext, _pos| {
+                    ctx.dispatch_typed_action(OnboardingCalloutViewAction::ToggleCheckbox);
+                }),
+            });
+
+        // Render the callout component with data from the model state
+        self.callout_component.render(
+            appearance,
+            onboarding_callout::Params {
+                title: options.title.to_string().into(),
+                text: options.text.into(),
+                step: options.step,
+                right_button,
+                options: onboarding_callout::Options {
+                    left_button,
+                    checkbox,
+                },
+            },
+        )
+    }
+}
+
+impl TypedActionView for OnboardingCalloutView {
+    type Action = OnboardingCalloutViewAction;
+
+    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
+        match action {
+            OnboardingCalloutViewAction::NextClicked => {
+                self.model.update(ctx, |model, ctx| {
+                    // Handle special cases for UniversalInput flow
+                    if let OnboardingCalloutState::UniversalInput(
+                        UniversalInputCalloutState::TalkToAgent,
+                    ) = model.state()
+                        && !model.has_project()
+                    {
+                        model.finish(ctx);
+                        return;
+                    }
+                    model.next(ctx);
+                });
+                ctx.notify();
+            }
+            OnboardingCalloutViewAction::SkipClicked => {
+                self.model.update(ctx, |model, ctx| {
+                    model.skip(ctx);
+                });
+                ctx.notify();
+            }
+            OnboardingCalloutViewAction::BackToTerminalClicked => {
+                self.model.update(ctx, |model, ctx| {
+                    model.back_to_terminal(ctx);
+                });
+                ctx.notify();
+            }
+            OnboardingCalloutViewAction::ToggleCheckbox => {
+                self.model.update(ctx, |model, ctx| {
+                    model.toggle_natural_language_detection(ctx);
+                });
+                ctx.notify();
+            }
+        }
+    }
+}
+
+impl SingletonEntity for OnboardingCalloutView {}
